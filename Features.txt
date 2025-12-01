@@ -1,0 +1,1169 @@
+HELIX —
+
+What: Helix is a globally-distributed, real-time backend microservices platform that provides personalized feeds, full-text search across posts/users/hashtags, ranking, high-throughput ingestion, and robust distribution & observability. It’s a systems-training crucible.
+
+Purpose: Force mastery of backend engineering at principal-architect depth: concurrency in Java, custom data structures, indexing, storage design, caching strategies, replication, failure-handling, observability, and chaos testing. Build components that are defendable in interviews and production-like in behavior.
+
+Constraints (Insane Mode, Multi-Region):
+
+Architecture: Microservices (each service is an independent JVM service).
+
+Language: Java 17+ (primary). PySpark allowed only for optional analytics jobs.
+
+No UI. Backend-only.
+
+Core structures implemented in-house where learning-critical (ring buffers, inverted index, tries, bloom filters, segmented logs). Use JVM concurrency primitives; avoid libraries that hide core learning.
+
+Deliverables per service: design doc, Java implementation, unit & integration tests, perf notes, failure modes, scaling notes, deployment manifest (Docker + k8s YAML).
+
+APIs: JSON-over-HTTP for control/admin; binary/length-prefixed TCP (or gRPC if you later choose) for high-throughput data plane; all mutation APIs must be idempotent and accept an idempotencyKey.
+
+Observability: All RPCs/events must carry traceId, requestId; metrics exported via MetricsCollector (Prometheus-friendly format).
+
+Repo layout: multi-repo model (one repo per microservice). Each repo follows consistent package naming: com.helix.<service>.
+
+TOPOLOGY — MICROSERVICE LIST & PRIMARY RESPONSIBILITIES
+
+helix-id-service — ID generation (Snowflake-style).
+
+helix-ingest-service — HTTP ingestion, WAL, local ring buffer, rate limiting.
+
+helix-graph-service — follow graph management, username trie, hot-account detection.
+
+helix-timeline-service — per-user timeline storage, segmented logs, cache layer.
+
+helix-fanout-service — fanout logic (push and read-time), strategy manager.
+
+helix-search-service — tokenization, indexing, search executor (inverted index, positional index, trie).
+
+helix-ranking-service — ranking engine and score APIs.
+
+helix-storage-service — persistent document storage adapter (Mongo-compatible API or custom SSTable writer) and index segment storage.
+
+helix-replication-service — WAL replication, anti-entropy, replica coordination.
+
+helix-observability-service — centralized metrics, tracing collector, alert rules.
+
+helix-chaos-service — load generator, chaos scenarios executor.
+
+helix-auth-service — minimal auth & ACL for admin endpoints.
+
+helix-gateway — API gateway and service mesh entry (routes to services, handles auth, rate-limits).
+
+helix-common-lib — shared models, serialization, net helpers, config parsing, metrics interface (pulled as dependency).
+
+Each microservice must include production-grade helpers (config, logging, metrics, health checks, admin APIs).
+
+FORMAT FOR EACH SERVICE BELOW
+
+For each service you will find:
+
+Service name + repo name
+
+Java package root
+
+All files (exact filenames) — includes interfaces, impls, helpers, models, exceptions, config, tests, Dockerfile, k8s manifests.
+
+Purpose (concise)
+
+Expected outcome (what “done” looks like)
+
+Tests (unit & integration test objectives)
+
+Step-by-step tasks (developer flow)
+
+Techniques & data structures (what you learn)
+
+System-design patterns used
+
+APIs (signature-level, HTTP endpoints & binary where relevant)
+
+Failure modes & monitoring hooks (what to watch)
+
+NOTE: This is exhaustive. If any file listed below is missing in your repo, the service is not production-grade.
+
+1) helix-id-service (repo: helix-id-service)
+
+Package: com.helix.id
+
+Files (exact):
+
+src/main/java/com/helix/id/SnowflakeIdGenerator.java
+
+src/main/java/com/helix/id/IdGeneratorConfig.java
+
+src/main/java/com/helix/id/IdGeneratorException.java
+
+src/main/java/com/helix/id/MachineIdResolver.java
+
+src/main/java/com/helix/id/ClockStabilizer.java
+
+src/main/java/com/helix/id/IdComponents.java
+
+src/main/java/com/helix/id/IdHttpController.java
+
+src/main/java/com/helix/id/IdServiceMain.java
+
+src/main/java/com/helix/id/metrics/IdMetricsCollector.java
+
+src/main/java/com/helix/id/health/IdHealthCheck.java
+
+src/main/resources/application.yml
+
+Dockerfile
+
+k8s/deployment.yaml
+
+k8s/service.yaml
+
+src/test/java/com/helix/id/SnowflakeIdGeneratorTest.java
+
+src/test/java/com/helix/id/MachineIdResolverTest.java
+
+src/test/java/com/helix/id/ClockStabilizerTest.java
+
+README.md
+
+Purpose: Provide globally unique, time-sortable 64-bit IDs with region & node bits, handling clock skews and sequence rollovers.
+
+Expected outcome: GET /v1/id/next or POST /v1/id/next returns unique monotonic id; service handles 200k+ QPS per instance (benchmarked), offers deterministic decomposition via /v1/id/parse/{id}.
+
+Tests:
+
+Monotonicity (single-thread & multithread).
+
+Uniqueness (concurrency).
+
+Sequence rollover behavior.
+
+Clock rollback behavior.
+
+MachineIdResolver edge cases.
+
+Tasks (step-by-step):
+
+Implement IdGeneratorConfig with epoch and bit allocation validation.
+
+Implement MachineIdResolver reading env config, validating uniqueness via admin test (optionally deterministic host hash fallback).
+
+Implement ClockStabilizer with pluggable policies (BLOCK, THROW, USE_LOGICAL_CLOCK).
+
+Implement SnowflakeIdGenerator using atomics; inject ClockStabilizer and MachineIdResolver.
+
+Add HTTP controller for admin and client endpoints (id generation, parse).
+
+Add metrics & health checks.
+
+Write tests and benchmark.
+
+Techniques & data structures: bitwise arithmetic, AtomicLong, CAS loops, volatile fields, ring buffer optional for pre-alloc sequences.
+
+System-design patterns: id generation, deterministic sharding.
+
+APIs:
+
+POST /v1/id/next → {status, traceId, payload: {id: long}}
+
+GET /v1/id/parse/{id} → {components: {timestamp, regionId, machineId, sequence}}
+
+Admin: GET /v1/id/metrics, GET /health
+
+Failure modes & monitoring hooks:
+
+metric: id_generation_rate, id_generation_latency, id_generation_errors.
+
+log on clock regression; health check fails if id generation blocked beyond threshold.
+
+2) helix-ingest-service (repo: helix-ingest-service)
+
+Package: com.helix.ingest
+
+Files (exact):
+
+src/main/java/com/helix/ingest/PostIngestionService.java
+
+src/main/java/com/helix/ingest/PostController.java
+
+src/main/java/com/helix/ingest/model/Post.java
+
+src/main/java/com/helix/ingest/wal/WALWriter.java
+
+src/main/java/com/helix/ingest/wal/WALReader.java
+
+src/main/java/com/helix/ingest/wal/WALSegment.java
+
+src/main/java/com/helix/ingest/queue/BoundedRingBuffer.java
+
+src/main/java/com/helix/ingest/ratelimit/TokenBucketRateLimiter.java
+
+src/main/java/com/helix/ingest/id/IdClient.java (client to helix-id-service)
+
+src/main/java/com/helix/ingest/ingestconfig/IngestionConfig.java
+
+src/main/java/com/helix/ingest/ingestconfig/IngestionException.java
+
+src/main/java/com/helix/ingest/service/IngestionWorker.java
+
+src/main/java/com/helix/ingest/service/IngestionManager.java
+
+src/main/java/com/helix/ingest/metrics/IngestMetricsCollector.java
+
+src/main/java/com/helix/ingest/health/IngestHealthCheck.java
+
+src/main/java/com/helix/ingest/admin/IngestAdminController.java (replay endpoints)
+
+src/main/resources/application.yml
+
+Dockerfile
+
+k8s/deployment.yaml
+
+k8s/service.yaml
+
+src/test/java/com/helix/ingest/WALWriterTest.java
+
+src/test/java/com/helix/ingest/BoundedRingBufferTest.java
+
+src/test/java/com/helix/ingest/TokenBucketRateLimiterTest.java
+
+src/test/java/com/helix/ingest/PostIngestionServiceTest.java
+
+README.md
+
+Purpose: Accept posts from clients (via helix-gateway), validate them, ensure idempotency, persist to WAL, enqueue to ring buffer for downstream processing (fanout & indexing), enforce rate limits, support WAL replay.
+
+Expected outcome: Durable ingest pipeline with backpressure and deterministic replay.
+
+Tests:
+
+WAL append & replay correctness.
+
+Ring buffer multi-producer/consumer safety.
+
+Rate limiter burst & steady-state.
+
+End-to-end: POST → WAL → replay → queue processing.
+
+Tasks:
+
+Define Post model with id, userId, content, ts, idempotencyKey, metadata.
+
+Implement WALWriter with segment rotation, checksum, durable fsync policy.
+
+Implement BoundedRingBuffer (power-of-two size, CAS-based producers).
+
+Implement TokenBucketRateLimiter with configurable refill rate and burst capacity.
+
+Integrate IdClient to fetch IDs when posts omit id.
+
+Implement PostIngestionService with synchronous WAL write for sync=true, else async enqueue after WAL append.
+
+Provide admin endpoint POST /v1/ingest/replay?since=<offset>.
+
+Tests & simulate disk-full scenario.
+
+Techniques & data structures: append-only WAL, ring buffer, token-bucket, file IO, checksums.
+
+System-design patterns: WAL, producer-consumer, backpressure.
+
+APIs:
+
+POST /v1/posts { userId, content, idempotencyKey?, sync?: boolean } → {status, traceId, payload:{postId}}
+
+Errors: 429 (rate limited), 500 (WAL error).
+
+POST /v1/ingest/replay?since=offset (admin)
+
+Health & metrics endpoints
+
+Failure modes & monitoring:
+
+metric: ingest_in_rate, ingest_queue_length, wal_write_errors.
+
+alerts: WAL write failure rate > threshold, queue depth > threshold.
+
+3) helix-graph-service (repo: helix-graph-service)
+
+Package: com.helix.graph
+
+Files (exact):
+
+src/main/java/com/helix/graph/FollowGraph.java (core adjacency storage)
+
+src/main/java/com/helix/graph/FollowCommandService.java (apply follow/unfollow)
+
+src/main/java/com/helix/graph/FollowQueryService.java (followers/following queries)
+
+src/main/java/com/helix/graph/model/FollowEdge.java
+
+src/main/java/com/helix/graph/UsernameTrie.java
+
+src/main/java/com/helix/graph/HashtagTrie.java
+
+src/main/java/com/helix/graph/HotAccountBloomFilter.java
+
+src/main/java/com/helix/graph/persistence/FollowSnapshotStore.java (serializes snapshots)
+
+src/main/java/com/helix/graph/persistence/ShardPersistor.java
+
+src/main/java/com/helix/graph/api/GraphController.java
+
+src/main/java/com/helix/graph/metrics/GraphMetricsCollector.java
+
+src/main/java/com/helix/graph/health/GraphHealthCheck.java
+
+src/main/resources/application.yml
+
+Dockerfile
+
+k8s/deployment.yaml
+
+k8s/service.yaml
+
+src/test/java/com/helix/graph/FollowGraphTest.java
+
+src/test/java/com/helix/graph/UsernameTrieTest.java
+
+src/test/java/com/helix/graph/HotAccountBloomFilterTest.java
+
+README.md
+
+Purpose: Manage follow/unfollow relationships, provide queries for followers/following, support prefix search on usernames and detect hot accounts for fanout strategy decisions.
+
+Expected outcome: High-throughput follow updates & fast follower lookups; trie-based prefix search for usernames, bloom filter hitting for hot accounts.
+
+Tests:
+
+Bulk follow/unfollow operations and invariants.
+
+Trie correctness.
+
+Bloom filter false-positive rate verification.
+
+Snapshot & recover tests.
+
+Tasks:
+
+Implement thread-safe adjacency lists: ConcurrentHashMap<UserId, FollowersList>.
+
+Implement FollowersList as dynamic compact array with append & binary search insert for ordered lists.
+
+Implement reverse edges for following lookup.
+
+Implement UsernameTrie/HashtagTrie.
+
+Implement HotAccountBloomFilter.
+
+Persist periodic snapshots and load on startup.
+
+Admin endpoints for dump & restore.
+
+Techniques & data structures: adjacency lists, tries, bloom filters, compact arrays.
+
+APIs:
+
+POST /v1/follow { followerId, followeeId, idempotencyKey? }
+
+POST /v1/unfollow { followerId, followeeId }
+
+GET /v1/followers/{userId}?limit=&cursor=
+
+GET /v1/following/{userId}?limit=&cursor=
+
+GET /v1/usernames/prefix?q=...&limit=10
+
+Failure modes & monitoring:
+
+metric: graph_write_rate, graph_snapshot_latency, followers_list_memory.
+
+alerts: extreme memory growth per shard, snapshot failure rate.
+
+4) helix-timeline-service (repo: helix-timeline-service)
+
+Package: com.helix.timeline
+
+Files (exact):
+
+src/main/java/com/helix/timeline/TimelineStore.java
+
+src/main/java/com/helix/timeline/SegmentedLog.java
+
+src/main/java/com/helix/timeline/Segment.java
+
+src/main/java/com/helix/timeline/SegmentIndex.java
+
+src/main/java/com/helix/timeline/SegmentCompactor.java
+
+src/main/java/com/helix/timeline/TimelineCacheLRU.java
+
+src/main/java/com/helix/timeline/TimelineService.java (internal connector for writes)
+
+src/main/java/com/helix/timeline/TimelineController.java (read API)
+
+src/main/java/com/helix/timeline/model/PostMeta.java
+
+src/main/java/com/helix/timeline/persistence/SegmentFileWriter.java
+
+src/main/java/com/helix/timeline/persistence/SegmentFileReader.java
+
+src/main/java/com/helix/timeline/metrics/TimelineMetricsCollector.java
+
+src/main/java/com/helix/timeline/health/TimelineHealthCheck.java
+
+src/main/resources/application.yml
+
+Dockerfile
+
+k8s/deployment.yaml
+
+k8s/service.yaml
+
+src/test/java/com/helix/timeline/SegmentedLogTest.java
+
+src/test/java/com/helix/timeline/TimelineCacheLRUTest.java
+
+src/test/java/com/helix/timeline/SegmentCompactorTest.java
+
+README.md
+
+Purpose: Durable append-only per-user timelines (segmented logs), read-optimized cache for recent posts, compaction worker to reduce storage & tombstones.
+
+Expected outcome: Efficient append and read for timelines with sub-20ms reads for last 100 posts under typical load (single-node benchmark).
+
+Tests:
+
+Append & read correctness.
+
+Segment rollover & index correctness.
+
+Cache eviction & correctness.
+
+Compaction correctness.
+
+Tasks:
+
+Implement SegmentedLog managing segment rollovers and indexes.
+
+Implement TimelineStore mapping user -> segment list and building read-last-N optimized path.
+
+Implement TimelineCacheLRU with bounded memory.
+
+Implement SegmentCompactor merging segments, dropping tombstones.
+
+Integrate metrics & health.
+
+Techniques & data structures: segmented append logs, file-backed segments, LRU caches, index files.
+
+APIs:
+
+Internal: TimelineStore.appendToTimeline(userId, PostMeta) (used by fanout service).
+
+Client read: GET /v1/timeline/{userId}?limit=50&cursor=...
+
+Failure modes & monitoring:
+
+metric: timeline_append_rate, timeline_read_latency, segment_compaction_time.
+
+alerts: compaction backlog growing, segment IO errors.
+
+5) helix-fanout-service (repo: helix-fanout-service)
+
+Package: com.helix.fanout
+
+Files (exact):
+
+src/main/java/com/helix/fanout/FanoutOnWriteProcessor.java
+
+src/main/java/com/helix/fanout/FanoutOnReadMerger.java
+
+src/main/java/com/helix/fanout/FanoutStrategyManager.java
+
+src/main/java/com/helix/fanout/FanoutWorkerPool.java
+
+src/main/java/com/helix/fanout/FanoutTask.java
+
+src/main/java/com/helix/fanout/DeferredFanoutStore.java (marks deferred posts)
+
+src/main/java/com/helix/fanout/InternalFanoutRpcClient.java (binary RPC)
+
+src/main/java/com/helix/fanout/FanoutController.java
+
+src/main/java/com/helix/fanout/metrics/FanoutMetricsCollector.java
+
+src/main/java/com/helix/fanout/health/FanoutHealthCheck.java
+
+src/main/resources/application.yml
+
+Dockerfile
+
+k8s/deployment.yaml
+
+k8s/service.yaml
+
+src/test/java/com/helix/fanout/FanoutOnWriteProcessorTest.java
+
+src/test/java/com/helix/fanout/FanoutOnReadMergerTest.java
+
+README.md
+
+Purpose: Decide push vs pull fanout strategies; perform push fanout with batching and bounded concurrency; support read-time merging with K-way merge and ranking hooks.
+
+Expected outcome: Hybrid fanout system that gracefully handles hot accounts and scales under heavy fanout while keeping latency constrained.
+
+Tests:
+
+Small fanout push correctness.
+
+Large-fanout fallback to deferred/pull.
+
+Read-time K-way merge correctness & pagination.
+
+Tasks:
+
+Implement FanoutStrategyManager to choose push/pull/hybrid based on follower count & hot account bloom filter.
+
+Implement FanoutOnWriteProcessor with batching & worker pool; push updates to TimelineStore via internal RPC.
+
+Implement FanoutOnReadMerger performing K-way merge across timeline shards; integrate RankingEngine calls.
+
+Implement deferred fanout bookkeeping for large fanout posts.
+
+Build robust retry & DLQ handling.
+
+Techniques & data structures: priority queue for K-way merge, batching, worker pools, consistent hashing for routing.
+
+APIs:
+
+Internal binary RPC: fanout.push(PostMeta, List<UserShard>) → ack
+
+Client: timeline read endpoint is handled in helix-timeline-service; fanout exposes admin endpoints for monitoring.
+
+Failure modes & monitoring:
+
+metric: fanout_push_latency, fanout_deferred_count, fanout_worker_errors.
+
+alerts: push worker saturation, DLQ growth.
+
+6) helix-search-service (repo: helix-search-service)
+
+Package: com.helix.search
+
+Files (exact):
+
+src/main/java/com/helix/search/Tokenizer.java
+
+src/main/java/com/helix/search/Normalizer.java
+
+src/main/java/com/helix/search/InvertedIndex.java
+
+src/main/java/com/helix/search/PostingList.java
+
+src/main/java/com/helix/search/PositionalIndex.java
+
+src/main/java/com/helix/search/TrieIndex.java
+
+src/main/java/com/helix/search/BloomFilterIndex.java
+
+src/main/java/com/helix/search/IndexBuilder.java
+
+src/main/java/com/helix/search/IndexSegmentManager.java
+
+src/main/java/com/helix/search/SearchExecutor.java
+
+src/main/java/com/helix/search/SearchController.java
+
+src/main/java/com/helix/search/IndexPersistence.java (writes segments to helix-storage-service)
+
+src/main/java/com/helix/search/metrics/SearchMetricsCollector.java
+
+src/main/java/com/helix/search/health/SearchHealthCheck.java
+
+src/main/resources/application.yml
+
+Dockerfile
+
+k8s/deployment.yaml
+
+k8s/service.yaml
+
+src/test/java/com/helix/search/TokenizerTest.java
+
+src/test/java/com/helix/search/InvertedIndexTest.java
+
+src/test/java/com/helix/search/PositionalIndexTest.java
+
+README.md
+
+Purpose: Provide full-text search (term, phrase, prefix) across posts using custom inverted index & positional index; handle incremental indexing with immutable segments & merges.
+
+Expected outcome: Search returns correct ranked results using TF-IDF/BM25, supports prefix suggestions, and handles concurrent updates.
+
+Tests:
+
+Tokenization & normalization correctness.
+
+Index build & query correctness.
+
+Positional queries (phrase search) correctness.
+
+Prefix suggestion via trie.
+
+Bloom filter pre-check performance.
+
+Tasks:
+
+Implement Tokenizer and Normalizer.
+
+Build InvertedIndex and PositionalIndex with segment-based postings.
+
+Implement IndexSegmentManager for segment writes, merges, and persistence hooks.
+
+Implement SearchExecutor supporting boolean & ranked queries.
+
+Add prefix/trie and bloom filter optimizations.
+
+Integration: ingest posts from helix-ingest-service and build indexes.
+
+Techniques & data structures: inverted posting lists, positional index, varint/delta compression (basic), trie, bloom filters, merges.
+
+APIs:
+
+POST /v1/search/query { q, size, cursor? } → list of {postId, score}
+
+GET /v1/search/suggest?q=abc&limit=10 → suggestions
+
+Failure modes & monitoring:
+
+metric: index_build_latency, search_latency_50/95/99, segment_merge_time.
+
+alerts: long-running merges, index inconsistency counters.
+
+7) helix-ranking-service (repo: helix-ranking-service)
+
+Package: com.helix.ranking
+
+Files (exact):
+
+src/main/java/com/helix/ranking/RankingEngine.java
+
+src/main/java/com/helix/ranking/ScoreFunctions.java
+
+src/main/java/com/helix/ranking/TimeDecayBuckets.java
+
+src/main/java/com/helix/ranking/PersonalizationStore.java (local model features)
+
+src/main/java/com/helix/ranking/RankingController.java
+
+src/main/java/com/helix/ranking/metrics/RankingMetricsCollector.java
+
+src/main/java/com/helix/ranking/health/RankingHealthCheck.java
+
+src/main/resources/application.yml
+
+Dockerfile
+
+k8s/deployment.yaml
+
+k8s/service.yaml
+
+src/test/java/com/helix/ranking/RankingEngineTest.java
+
+README.md
+
+Purpose: Score candidate posts for a user context (recency decay, engagement, personalization heuristics); expose a ranking API used by fanout/read merging.
+
+Expected outcome: Deterministic ranking; reproducible tie-breaking.
+
+Tests:
+
+Score functions correctness.
+
+Top-K selection via heap.
+
+Deterministic outputs for same input.
+
+Tasks:
+
+Implement primitive score functions and normalization.
+
+Implement RankingEngine.rank(candidates, userContext, k).
+
+Expose ranking API for other services.
+
+Techniques & data structures: priority queue (heap), sliding windows, rolling counters.
+
+APIs:
+
+Internal RPC: ranking.rank(List<Candidate>, UserContext, k) → ranked list
+
+Failure modes & monitoring:
+
+metric: ranking_latency, ranking_errors.
+
+alerts: degradation of ranking latency.
+
+8) helix-storage-service (repo: helix-storage-service)
+
+Package: com.helix.storage
+
+Files (exact):
+
+src/main/java/com/helix/storage/DocumentStore.java (interface)
+
+src/main/java/com/helix/storage/mongodb/MongoDocumentStore.java (production adapter)
+
+src/main/java/com/helix/storage/sstable/SSTableWriter.java (optional custom segment writer)
+
+src/main/java/com/helix/storage/IndexSegmentStore.java (stores index segments)
+
+src/main/java/com/helix/storage/IndexSegmentReader.java
+
+src/main/java/com/helix/storage/IndexSegmentWriter.java
+
+src/main/java/com/helix/storage/StorageController.java
+
+src/main/java/com/helix/storage/metrics/StorageMetricsCollector.java
+
+src/main/java/com/helix/storage/health/StorageHealthCheck.java
+
+src/main/resources/application.yml
+
+Dockerfile
+
+k8s/deployment.yaml
+
+k8s/service.yaml
+
+src/test/java/com/helix/storage/MongoDocumentStoreTest.java
+
+src/test/java/com/helix/storage/SSTableWriterTest.java
+
+README.md
+
+Purpose: Persist full documents and index segments. Default adapter: MongoDB for document store; storage of index segments on disk or object store.
+
+Expected outcome: Durable storage for posts; index segments persisted reliably with versioning & checksums.
+
+Tests:
+
+Document store CRUD correctness.
+
+SSTable writer/reader correctness & checksums.
+
+Index segment read/write tests.
+
+Tasks:
+
+Implement DocumentStore interface and Mongo adapter.
+
+Implement IndexSegmentWriter and IndexSegmentReader for custom segment files with checksums.
+
+Add admin endpoints to fetch segments and health checks.
+
+Techniques & data structures: SSTable-like segment format, checksums, versioned object store layout.
+
+APIs:
+
+Internal: DocumentStore.put(postId, document), DocumentStore.get(postId)
+
+Admin: GET /v1/storage/segment/{id}, POST /v1/storage/segment/upload
+
+Failure modes & monitoring:
+
+metric: storage_put_latency, storage_get_failure_rate.
+
+alerts: object store write failure rate, checksum mismatches.
+
+9) helix-replication-service (repo: helix-replication-service)
+
+Package: com.helix.replication
+
+Files (exact):
+
+src/main/java/com/helix/replication/ReplicaManager.java
+
+src/main/java/com/helix/replication/WriteAheadReplicator.java
+
+src/main/java/com/helix/replication/ReplicationRpcClient.java
+
+src/main/java/com/helix/replication/VersionVector.java
+
+src/main/java/com/helix/replication/AntiEntropyService.java
+
+src/main/java/com/helix/replication/HintedHandoffStore.java
+
+src/main/java/com/helix/replication/metrics/ReplicationMetricsCollector.java
+
+src/main/java/com/helix/replication/health/ReplicationHealthCheck.java
+
+src/main/resources/application.yml
+
+Dockerfile
+
+k8s/deployment.yaml
+
+k8s/service.yaml
+
+src/test/java/com/helix/replication/VersionVectorTest.java
+
+src/test/java/com/helix/replication/WriteAheadReplicatorTest.java
+
+README.md
+
+Purpose: Replicate WAL entries & segments across regions; provide anti-entropy reconciliation; support sync/async/quorum replication modes.
+
+Expected outcome: WAL replication with ack semantics; convergence after partitions heal.
+
+Tests:
+
+WAL replication correctness across simulated peers.
+
+Version vector conflict resolution correctness.
+
+Anti-entropy reconciliation.
+
+Tasks:
+
+Implement WriteAheadReplicator streaming WAL segments to peers.
+
+Implement ReplicaManager handling peer health & acking logic.
+
+Implement AntiEntropyService to reconcile missing WAL entries.
+
+Implement HintedHandoffStore to buffer writes when peers are down.
+
+Techniques & data structures: append-log replication, vector clocks, hinted handoff.
+
+APIs:
+
+Internal RPC: replicate.append(segmentId, entries[]) with ack.
+
+Admin: GET /v1/replication/status, POST /v1/replication/sync?peer=...
+
+Failure modes & monitoring:
+
+metric: replication_latency, replication_lag.
+
+alerts: replication backlog, persistent peer down.
+
+10) helix-observability-service (repo: helix-observability-service)
+
+Package: com.helix.observability
+
+Files (exact):
+
+src/main/java/com/helix/observability/MetricsCollector.java (interface)
+
+src/main/java/com/helix/observability/PrometheusExporter.java
+
+src/main/java/com/helix/observability/TracingCollector.java
+
+src/main/java/com/helix/observability/LogContext.java
+
+src/main/java/com/helix/observability/HealthAggregator.java
+
+src/main/java/com/helix/observability/AlertRulesManager.java
+
+src/main/java/com/helix/observability/ObservabilityController.java
+
+src/main/resources/application.yml
+
+Dockerfile
+
+k8s/deployment.yaml
+
+k8s/service.yaml
+
+src/test/java/com/helix/observability/MetricsCollectorTest.java
+
+README.md
+
+Purpose: Centralize metrics & tracing from services; provide scrape endpoint for Prometheus; aggregate health checks and support simple alert rules.
+
+Expected outcome: Reliable metrics collection and trace ingestion; health aggregation across services.
+
+Tests:
+
+Metric ingestion & export tests.
+
+Trace propagation registration tests.
+
+Tasks:
+
+Define MetricsCollector interface used by all services (pull dependency on helix-common-lib).
+
+Implement PrometheusExporter and TracingCollector.
+
+Expose /metrics and aggregated health endpoints.
+
+Techniques & data structures: histogram buckets, counters, trace sampling.
+
+APIs:
+
+GET /metrics (Prometheus format)
+
+POST /v1/traces (ingest)
+
+GET /health/aggregate
+
+Failure modes & monitoring:
+
+metric: observability_ingest_rate, observability_export_errors.
+
+11) helix-chaos-service (repo: helix-chaos-service)
+
+Package: com.helix.chaos
+
+Files (exact):
+
+src/main/java/com/helix/chaos/LoadGenerator.java
+
+src/main/java/com/helix/chaos/ScenarioConfig.java
+
+src/main/java/com/helix/chaos/ChaosMonkey.java
+
+src/main/java/com/helix/chaos/ChaosController.java
+
+src/main/java/com/helix/chaos/ChaosRunner.java
+
+src/main/resources/application.yml
+
+Dockerfile
+
+k8s/deployment.yaml
+
+k8s/service.yaml
+
+src/test/java/com/helix/chaos/LoadGeneratorTest.java
+
+README.md
+
+Purpose: Generate realistic workloads & inject failures (node kills, network delays, disk errors) to validate Helix's resilience.
+
+Expected outcome: Scenarios that reproduce scale and failure cases; reports with metrics & traces.
+
+Tests/Scenarios:
+
+1M simulated users with 100K QPS burst (simulation mode).
+
+Hot account fanout storm.
+
+Node crash during fanout flush.
+
+Disk full simulation during WAL write.
+
+Tasks:
+
+Implement LoadGenerator simulating user behaviors.
+
+Implement ChaosMonkey to inject failures across services (via k8s API or simulated local).
+
+Create scenarios and result reporters.
+
+APIs:
+
+POST /chaos/run { scenarioId } — run scenario (test-only).
+
+GET /chaos/status/{runId}
+
+Failure modes & monitoring: observe systemwide metrics and collect traces for debugging.
+
+12) helix-auth-service (repo: helix-auth-service)
+
+Package: com.helix.auth
+
+Files (exact):
+
+src/main/java/com/helix/auth/AuthController.java
+
+src/main/java/com/helix/auth/AuthService.java
+
+src/main/java/com/helix/auth/TokenManager.java
+
+src/main/java/com/helix/auth/acl/AdminAcl.java
+
+src/main/resources/application.yml
+
+Dockerfile
+
+k8s/deployment.yaml
+
+k8s/service.yaml
+
+src/test/java/com/helix/auth/AuthServiceTest.java
+
+README.md
+
+Purpose: Provide minimal authentication for admin APIs and service-to-service auth tokens.
+
+Expected outcome: Secure admin endpoints and a token exchange for internal RPC.
+
+APIs:
+
+POST /v1/auth/token (admin login)
+
+GET /v1/auth/validate?token=...
+
+Failure modes & monitoring: token expiry, broken ACLs.
+
+13) helix-gateway (repo: helix-gateway)
+
+Package: com.helix.gateway
+
+Files (exact):
+
+src/main/java/com/helix/gateway/GatewayController.java
+
+src/main/java/com/helix/gateway/RateLimitFilter.java
+
+src/main/java/com/helix/gateway/AuthFilter.java
+
+src/main/java/com/helix/gateway/ServiceDiscoveryClient.java
+
+src/main/resources/application.yml
+
+Dockerfile
+
+k8s/deployment.yaml
+
+k8s/service.yaml
+
+src/test/java/com/helix/gateway/GatewayControllerTest.java
+
+README.md
+
+Purpose: External entrypoint, route requests to internal services, apply auth & client-side rate-limiting.
+
+Expected outcome: Single public endpoint for clients; performs TLS termination, auth, and routing.
+
+APIs: Proxy endpoints mapping to each service’s public endpoints.
+
+Failure modes & monitoring: gateway errors, request routing failures.
+
+14) helix-common-lib (repo: helix-common-lib)
+
+Package: com.helix.common
+
+Files (exact):
+
+src/main/java/com/helix/common/tracing/TraceUtil.java
+
+src/main/java/com/helix/common/serialization/JsonSerde.java
+
+src/main/java/com/helix/common/net/TcpClient.java (length-prefixed helper)
+
+src/main/java/com/helix/common/config/ConfigUtil.java
+
+src/main/java/com/helix/common/metrics/MetricsInterface.java
+
+src/main/java/com/helix/common/health/HealthInterface.java
+
+src/main/java/com/helix/common/logging/LogContext.java
+
+src/main/resources/application.yml
+
+README.md
+
+Purpose: Shared models, serialization, tracing utilities, basic TCP helpers, and metrics interface. All services depend on this.
+
+CROSS-COMPONENT CONTRACTS, TESTS & DEPLOYMENT NOTES
+
+Design Doc Requirement: Before coding each service, produce a one-page design doc:
+
+Purpose
+
+Public APIs & contracts
+
+Invariants & failure modes
+
+Scaling notes & thresholds
+
+Test plan & acceptance criteria
+
+Deployment considerations
+
+Integration testing harness: A separate repo helix-integration-tests will compose services in Docker Compose / k8s test namespace, run test scenarios, and validate end-to-end flows (ingest → fanout → timeline → search).
+
+CI/CD: Each repo must have GitHub Actions / Jenkins pipelines:
+
+unit tests
+
+build & dockerize
+
+static code checks (SpotBugs, Checkstyle)
+
+integration tests on merge to develop branch
+
+performance benchmark runs gated for main.
+
+K8s & manifests: Each service includes k8s/deployment.yaml, k8s/service.yaml, and optional HPA config. Use ConfigMaps for application.yml. Provide Helm charts later if needed.
+
+Service Discovery: Use DNS-based discovery or lightweight service registry (implement ServiceDiscoveryClient in gateway and helix-common-lib).
+
+Security & TLS: Services communicate over mTLS (certificate management left to infra). For dev, use self-signed.
+
+ORDER OF IMPLEMENTATION (exact sequence — do not deviate)
+
+helix-common-lib (shared utilities)
+
+helix-id-service (ID generation)
+
+helix-ingest-service (WAL & ingestion)
+
+helix-graph-service (follow graph)
+
+helix-timeline-service (segmented logs & cache)
+
+helix-fanout-service (push/pull logic)
+
+helix-storage-service (document & segment persistence)
+
+helix-search-service (indexing & query)
+
+helix-ranking-service (ranking)
+
+helix-replication-service (WAL replication)
+
+helix-observability-service (metrics/tracing)
+
+helix-chaos-service (load & chaos)
+
+helix-auth-service & helix-gateway
+
+Integration tests & performance benchmarking
+
+At each step produce:
+
+One-page design doc
+
+Unit & integration tests
+
+Performance notes & a README with run commands
+
+TESTING STRATEGY (exact)
+
+Unit tests: JUnit for all small components (goal: >90% coverage on core algorithms).
+
+Component integration tests: Each service must have an integration test using in-memory or dockerized dependencies (e.g., Mongo test container).
+
+System integration tests: helix-integration-tests runs multi-service scenarios in k8s test namespace or Docker Compose for a single-node run.
+
+Perf tests: Use helix-chaos-service to run realistic loads; collect 50/95/99 latencies & throughput.
+
+Acceptance criteria: see earlier acceptance list (ID monotonicity, WAL durability, timeline read latency, search correctness, recovery after node crash).
+
+FAILURE MODES & DOCUMENTATION (per-component, required)
+
+For every service and file above, include a doc section (in repository docs/FAILURE_MODES.md) detailing:
+
+Common failures
+
+Detection signals (metrics & logs)
+
+Recovery steps (manual and automated)
+
+Tradeoffs chosen and justification (e.g., durability vs latency)
+
+Capacity & cost implications
+
+A component is not done until this is written.
