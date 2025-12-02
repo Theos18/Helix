@@ -1,8 +1,5 @@
 package com.helix.id;
 
-import java.util.concurrent.atomic.AtomicInteger;
-import java.util.concurrent.atomic.AtomicLong;
-
 /**Helper function to decide - Given CurrenttimeStamp and LastUsedTimeStamp - Is it safe to use for ID generation or not*/
 
 public class ClockStabilizer{

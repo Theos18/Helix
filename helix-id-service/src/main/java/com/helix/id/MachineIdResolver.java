@@ -25,4 +25,8 @@ public class MachineIdResolver{
         long ConvertedMachineId = hash % 1024;
         return ConvertedMachineId;
     }
+
+    public long GetMachineID(){
+        return MachineId;
+    }
 }
